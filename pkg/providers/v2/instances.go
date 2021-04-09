@@ -54,18 +54,36 @@ func newInstances(az string, creds *credentials.Credentials, tags awsTagging) (c
 
 	return &instances{
 		availabilityZone: az,
-		ec2:              ec2Service,
-		region:           region,
-		tags:             tags,
+		creds:            creds,
+		ec2: map[string]EC2{
+			region: ec2Service,
+		},
+		region: region,
+		tags:   tags,
 	}, nil
 }
 
 // instances is an implementation of cloudprovider.InstancesV2
 type instances struct {
 	availabilityZone string
-	ec2              EC2
+	creds            *credentials.Credentials
+	ec2              map[string]EC2
 	region           string
 	tags             awsTagging
+}
+
+func (i *instances) EC2FromRegion(region string) EC2 {
+	if _, ok := i.ec2[region]; !ok {
+		ec2Sess, err := session.NewSession(&aws.Config{
+			Region:      aws.String(region),
+			Credentials: i.creds,
+		})
+		if err != nil {
+			panic(err)
+		}
+		i.ec2[region] = ec2.New(ec2Sess)
+	}
+	return i.ec2[region]
 }
 
 // InstanceExists indicates whether a given node exists according to the cloud provider
@@ -136,6 +154,7 @@ func (i *instances) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloud
 // If false an error will be returned, the instance will be immediately deleted by the cloud controller manager.
 func (i *instances) getInstance(ctx context.Context, node *v1.Node) (*ec2.Instance, error) {
 	var request *ec2.DescribeInstancesInput
+	region := i.region
 	if node.Spec.ProviderID == "" {
 		// get Instance by private DNS name
 		request = &ec2.DescribeInstancesInput{
@@ -149,6 +168,12 @@ func (i *instances) getInstance(ctx context.Context, node *v1.Node) (*ec2.Instan
 		instanceID, err := parseInstanceIDFromProviderID(node.Spec.ProviderID)
 		if err != nil {
 			return nil, err
+		}
+
+		nodeRegion, err := parseRegionFromProviderID(node.Spec.ProviderID)
+		if err == nil {
+			klog.V(4).Infof("node with provider ID %v is in region %s", node.Spec.ProviderID, nodeRegion)
+			region = nodeRegion
 		}
 
 		request = &ec2.DescribeInstancesInput{
@@ -167,7 +192,7 @@ func (i *instances) getInstance(ctx context.Context, node *v1.Node) (*ec2.Instan
 	instances := []*ec2.Instance{}
 	var nextToken *string
 	for {
-		response, err := i.ec2.DescribeInstances(request)
+		response, err := i.EC2FromRegion(region).DescribeInstances(request)
 		if err != nil {
 			return nil, fmt.Errorf("error describing ec2 instances: %v", err)
 		}
@@ -270,6 +295,25 @@ func parseInstanceIDFromProviderID(providerID string) (string, error) {
 	}
 
 	return instanceID, nil
+}
+
+// parseRegionFromProviderID parses the node's region from the providerID, assuming it contains the node's zone
+// This function always assumes a valid providerID format was provided.
+func parseRegionFromProviderID(providerID string) (string, error) {
+	zone := ""
+	metadata := strings.Split(strings.TrimPrefix(providerID, "aws://"), "/")
+	if len(metadata) == 1 {
+		// instance-id
+		return "", fmt.Errorf("no availability zone present in providerID %s", providerID)
+	} else if len(metadata) == 2 {
+		// az/instance-id
+		zone = metadata[0]
+	} else if len(metadata) == 3 {
+		// /az/instance-id
+		zone = metadata[1]
+	}
+
+	return azToRegion(zone)
 }
 
 func newEc2Filter(name string, values ...string) *ec2.Filter {
